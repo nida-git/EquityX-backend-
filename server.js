@@ -2,24 +2,62 @@ import express from "express";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
 import cors from "cors";
+import helmet from "helmet";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "pe-fund-dev-secret";
+const JWT_SECRET = process.env.JWT_SECRET;
+const allowedOrigins = (
+  process.env.CLIENT_ORIGINS ||
+  (process.env.NODE_ENV === "production"
+    ? ""
+    : "http://localhost:5173,http://127.0.0.1:5173")
+)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET must be set in the environment.");
+}
+
+if (process.env.NODE_ENV === "production" && JWT_SECRET.length < 32) {
+  throw new Error("JWT_SECRET must be at least 32 characters in production.");
+}
 
 app.use(
   cors({
-    origin: ["http://localhost:5173", "http://127.0.0.1:5173"],
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      const error = new Error("Origin is not allowed by CORS.");
+      error.status = 403;
+      return callback(error);
+    },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
+
+const respondWithServerError = (res, message, error) => {
+  if (process.env.NODE_ENV === "production") {
+    console.error(message, error instanceof Error ? error.name : "Unknown error");
+  } else {
+    console.error(message, error);
+  }
+  return res.status(500).json({ message });
+};
 
 const normalizeEmail = (email = "") => email.trim().toLowerCase();
 
@@ -80,8 +118,12 @@ const ensureDefaultAdmin = async () => {
   const adminEmail = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD || "";
 
-  if (!adminEmail || !adminPassword) {
+  if (!adminEmail && !adminPassword) {
     return;
+  }
+
+  if (!adminEmail || !adminPassword) {
+    throw new Error("ADMIN_EMAIL and ADMIN_PASSWORD must both be configured.");
   }
 
   const existingAdmin = await User.findOne({ email: adminEmail });
@@ -112,6 +154,60 @@ const ensureDefaultAdmin = async () => {
   });
 
   console.log(`Default admin created: ${adminUser.email}`);
+};
+
+let databaseConnectionPromise;
+let adminInitializationPromise;
+
+const ensureDatabaseConnected = async () => {
+  if (!process.env.MONGODB_URL) {
+    throw new Error("MONGODB_URL must be set in the environment.");
+  }
+
+  if (mongoose.connection.readyState !== 1) {
+    if (mongoose.connection.readyState !== 2) {
+      databaseConnectionPromise = undefined;
+    }
+
+    if (!databaseConnectionPromise) {
+      databaseConnectionPromise = mongoose
+        .connect(process.env.MONGODB_URL, {
+          maxPoolSize: 10,
+          serverSelectionTimeoutMS: 10000,
+        })
+        .then(() => {
+          console.log("Connected to MongoDB");
+        })
+        .catch((error) => {
+          databaseConnectionPromise = undefined;
+          throw error;
+        });
+    }
+
+    await databaseConnectionPromise;
+  }
+
+  if (!adminInitializationPromise) {
+    adminInitializationPromise = ensureDefaultAdmin().catch((error) => {
+      adminInitializationPromise = undefined;
+      throw error;
+    });
+  }
+
+  await adminInitializationPromise;
+};
+
+const connectToDatabase = async (req, res, next) => {
+  try {
+    await ensureDatabaseConnected();
+    next();
+  } catch (error) {
+    console.error(
+      "Database initialization failed:",
+      error instanceof Error ? error.name : "Unknown error",
+    );
+    res.status(503).json({ message: "Database unavailable." });
+  }
 };
 
 const fundSchema = new mongoose.Schema(
@@ -241,37 +337,40 @@ const protect = async (req, res, next) => {
     return res.status(401).json({ message: "Authentication required." });
   }
 
+  const token = authHeader.slice("Bearer ".length);
+  let decoded;
+
   try {
-    const token = authHeader.split(" ")[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(decoded.id);
-
-    if (!user) {
-      return res.status(401).json({ message: "User not found." });
-    }
-
-    if (!user.token || user.token !== token) {
-      return res.status(401).json({ message: "Invalid or expired token." });
-    }
-
-    if (user.status === "pending") {
-      return res.status(403).json({
-        message: "Your account is pending admin approval.",
-      });
-    }
-
-    if (user.status === "blocked") {
-      return res.status(403).json({
-        message:
-          "Your account has been blocked. Please contact an administrator.",
-      });
-    }
-
-    req.user = user;
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (error) {
     return res.status(401).json({ message: "Invalid or expired token." });
   }
+
+  const user = await User.findById(decoded.id);
+
+  if (!user) {
+    return res.status(401).json({ message: "User not found." });
+  }
+
+  if (!user.token || user.token !== token) {
+    return res.status(401).json({ message: "Invalid or expired token." });
+  }
+
+  if (user.status === "pending") {
+    return res.status(403).json({
+      message: "Your account is pending admin approval.",
+    });
+  }
+
+  if (user.status === "blocked") {
+    return res.status(403).json({
+      message:
+        "Your account has been blocked. Please contact an administrator.",
+    });
+  }
+
+  req.user = user;
+  next();
 };
 
 const requireAdmin = (req, res, next) => {
@@ -329,17 +428,30 @@ app.get("/", (req, res) => {
   res.send("Business Backend is running");
 });
 
+app.use("/api", connectToDatabase);
+
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: "ok", database: "connected" });
+});
+
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    if (!name || !email || !password) {
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !name.trim() ||
+      !email.trim() ||
+      !password
+    ) {
       return res.status(400).json({
         message: "Name, email and password are required.",
       });
     }
 
-    if (typeof password !== "string" || password.length < 6) {
+    if (password.length < 6) {
       return res.status(400).json({
         message: "Password must be at least 6 characters long.",
       });
@@ -377,10 +489,7 @@ app.post("/api/auth/register", async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({
-      message: "Failed to register user.",
-      error: error.message,
-    });
+    respondWithServerError(res, "Failed to register user.", error);
   }
 });
 
@@ -388,7 +497,12 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (
+      typeof email !== "string" ||
+      !email.trim() ||
+      typeof password !== "string" ||
+      !password
+    ) {
       return res
         .status(400)
         .json({ message: "Email and password are required." });
@@ -436,7 +550,7 @@ app.post("/api/auth/login", async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ message: "Failed to login.", error: error.message });
+    respondWithServerError(res, "Failed to login.", error);
   }
 });
 
@@ -459,7 +573,7 @@ app.post("/api/auth/logout", protect, async (req, res) => {
 
     res.status(200).json({ message: "Logout successful." });
   } catch (error) {
-    res.status(500).json({ message: "Failed to log out." });
+    respondWithServerError(res, "Failed to log out.", error);
   }
 });
 
@@ -486,14 +600,12 @@ app.get("/api/admin/users", protect, requireAdmin, async (req, res) => {
       name: { $exists: true, $ne: null, $ne: "" },
       email: { $exists: true, $ne: null, $ne: "" },
     })
-      .select("-password")
+      .select("-password -token")
       .sort({ createdAt: -1 });
 
     res.status(200).json({ users });
   } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Failed to fetch users.", error: error.message });
+    respondWithServerError(res, "Failed to fetch users.", error);
   }
 });
 
@@ -553,10 +665,7 @@ app.patch(
         },
       });
     } catch (error) {
-      res.status(500).json({
-        message: "Failed to update user status.",
-        error: error.message,
-      });
+      respondWithServerError(res, "Failed to update user status.", error);
     }
   },
 );
@@ -568,9 +677,7 @@ app.get("/api/funds", protect, async (req, res) => {
     });
     res.status(200).json(funds);
   } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Failed to fetch funds.", error: error.message });
+    respondWithServerError(res, "Failed to fetch funds.", error);
   }
 });
 
@@ -590,9 +697,7 @@ app.post("/api/funds", protect, async (req, res) => {
 
     res.status(201).json({ message: "Fund created successfully.", fund });
   } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Failed to create fund.", error: error.message });
+    respondWithServerError(res, "Failed to create fund.", error);
   }
 });
 
@@ -609,10 +714,7 @@ app.get("/api/closes", protect, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error fetching closes:", error);
-    res
-      .status(500)
-      .json({ message: "Failed to fetch closes", error: error.message });
+    respondWithServerError(res, "Failed to fetch closes.", error);
   }
 });
 
@@ -623,7 +725,6 @@ app.post("/api/closes/merge", protect, async (req, res) => {
     if (!date) {
       return res.status(400).json({ message: "Close date is required." });
     }
-    console.log("running1");
     const closes = await syncUserCloseState(req.user._id);
     const nextClose = closes.find((close, index) => index > 0 && !close.merged);
 
@@ -635,8 +736,6 @@ app.post("/api/closes/merge", protect, async (req, res) => {
 
     nextClose.merged = true;
     await nextClose.save();
-    console.log("running");
-
     const updatedCloses = await Close.find({ user: req.user._id }).sort({
       date: 1,
     });
@@ -651,10 +750,7 @@ app.post("/api/closes/merge", protect, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error merging close:", error);
-    res
-      .status(500)
-      .json({ message: "Failed to merge close", error: error.message });
+    respondWithServerError(res, "Failed to merge close.", error);
   }
 });
 
@@ -663,7 +759,7 @@ app.get("/api/companies", protect, async (req, res) => {
     const companies = await Company.find({ user: req.user._id });
     res.status(200).json(companies);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to fetch companies.", error);
   }
 });
 
@@ -690,7 +786,7 @@ app.post("/api/companies", protect, async (req, res) => {
       .status(201)
       .json({ message: "Company added successfully", company: newCompany });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to create company.", error);
   }
 });
 
@@ -725,7 +821,7 @@ app.put("/api/companies/:id", protect, async (req, res) => {
     await company.save();
     res.status(200).json({ message: "Company updated successfully", company });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to update company.", error);
   }
 });
 
@@ -742,7 +838,7 @@ app.delete("/api/companies/:id", protect, async (req, res) => {
 
     res.status(200).json({ message: "Company deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to delete company.", error);
   }
 });
 
@@ -768,10 +864,7 @@ app.post("/api/lps", protect, async (req, res) => {
 
     res.status(201).json({ message: "LP saved successfully", data: savedLp });
   } catch (error) {
-    console.error("Error saving LP:", error);
-    res
-      .status(500)
-      .json({ message: "Failed to save LP", error: error.message });
+    respondWithServerError(res, "Failed to save LP.", error);
   }
 });
 
@@ -780,10 +873,7 @@ app.get("/api/lps", protect, async (req, res) => {
     const lps = await Lp.find({ user: req.user._id }).sort({ createdAt: -1 });
     res.status(200).json(lps);
   } catch (error) {
-    console.error("Error fetching LPs:", error);
-    res
-      .status(500)
-      .json({ message: "Failed to fetch LPs", error: error.message });
+    respondWithServerError(res, "Failed to fetch LPs.", error);
   }
 });
 
@@ -806,7 +896,7 @@ app.put("/api/lps/:id", protect, async (req, res) => {
     await syncUserCloseState(req.user._id);
     res.status(200).json(lp);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to update LP.", error);
   }
 });
 
@@ -824,25 +914,45 @@ app.delete("/api/lps/:id", protect, async (req, res) => {
     await syncUserCloseState(req.user._id);
     res.status(200).json({ message: "LP deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    respondWithServerError(res, "Failed to delete LP.", error);
   }
 });
 
-if (!process.env.MONGODB_URL) {
-  console.error("MONGODB_URL is missing in your environment variables.");
-  process.exit(1);
-}
+app.use((req, res) => {
+  res.status(404).json({ message: "Not found." });
+});
 
-mongoose
-  .connect(process.env.MONGODB_URL)
-  .then(async () => {
-    console.log("Connected to MongoDB");
-    await ensureDefaultAdmin();
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-  })
-  .catch((error) => {
-    console.error("MongoDB connection failed:", error.message);
-    process.exit(1);
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  if (error.status === 400) {
+    return res.status(400).json({ message: "Invalid request payload." });
+  }
+
+  if (error.status === 403) {
+    return res.status(403).json({ message: "Origin is not allowed." });
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    console.error(
+      "Unhandled request error:",
+      error instanceof Error ? error.name : "Unknown error",
+    );
+  } else {
+    console.error("Unhandled request error:", error);
+  }
+  return res.status(500).json({ message: "Internal server error." });
+});
+
+export default app;
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
   });
+}

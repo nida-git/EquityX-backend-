@@ -5,9 +5,13 @@ import bcrypt from "bcryptjs";
 dotenv.config({ path: ".env" });
 
 const run = async () => {
-  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD;
   const adminName = process.env.ADMIN_NAME || "System Administrator";
+
+  if (!process.env.MONGODB_URL) {
+    throw new Error("MONGODB_URL must be set in the backend .env file.");
+  }
 
   if (!adminEmail || !adminPassword) {
     throw new Error(
@@ -35,7 +39,7 @@ const run = async () => {
     ),
   );
 
-  const existingAdmin = await User.findOne({ email: adminEmail.toLowerCase() });
+  const existingAdmin = await User.findOne({ email: adminEmail });
 
   if (existingAdmin) {
     existingAdmin.role = "admin";
@@ -49,7 +53,7 @@ const run = async () => {
 
   const adminUser = await User.create({
     name: adminName,
-    email: adminEmail.toLowerCase(),
+    email: adminEmail,
     password: await bcrypt.hash(adminPassword, 10),
     role: "admin",
     status: "approved",
